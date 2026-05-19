@@ -3,15 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QPainter
+from PySide6.QtGui import QAction
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -142,8 +140,9 @@ class MainWindow(QMainWindow):
                 geom = self.silhouette.generate(canvas, p)
 
             geom = ensure_connected(geom, p.bridge_width)
-            if not validate_connectivity(geom):
-                raise ValueError("Не удалось связать все островки.")
+            connected = validate_connectivity(geom, p.bridge_width)
+            if not connected:
+                QMessageBox.warning(self, "Предупреждение", "Часть островков не удалось полностью связать, результат будет экспортирован как есть.")
 
             self.current_geometry = geom
             self.refresh_preview()
