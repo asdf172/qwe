@@ -185,7 +185,10 @@ class MainWindow(QMainWindow):
         self.image_label = QLabel("Файл не выбран")
         self.import_btn = QPushButton("Импорт PNG/JPG")
         self.import_btn.clicked.connect(self.import_image)
+        self.auto_btn = QPushButton("Автонастройка изображения")
+        self.auto_btn.clicked.connect(self.auto_tune_image)
         sil_layout.addWidget(self.import_btn)
+        sil_layout.addWidget(self.auto_btn)
         sil_layout.addWidget(self.image_label)
 
         layout.addWidget(base_box)
@@ -258,5 +261,14 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Выбрать изображение", "", "Images (*.png *.jpg *.jpeg)")
         if path:
             self.silhouette.set_image(path)
+            self.silhouette.auto_tune()
             self.image_label.setText(Path(path).name)
-            QMessageBox.information(self, "Импорт", f"Изображение загружено: {path}")
+            QMessageBox.information(self, "Импорт", f"Изображение загружено и автонастроено: {path}")
+
+
+    def auto_tune_image(self) -> None:
+        try:
+            self.silhouette.auto_tune()
+            QMessageBox.information(self, "Автонастройка", "Параметры изображения автоматически настроены.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Автонастройка", f"Не удалось автонастроить: {exc}")
