@@ -5,7 +5,6 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QPainter
-from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
     QComboBox,
@@ -48,10 +47,13 @@ class SvgPreview(QGraphicsView):
         self.svg_item: Optional[QGraphicsSvgItem] = None
 
     def load_svg(self, path: str) -> None:
+        """Load SVG into scene.
+
+        Important: use file-backed QGraphicsSvgItem(path) to avoid renderer lifecycle
+        issues that can crash the app when a temporary QSvgRenderer is garbage-collected.
+        """
         self.scene_obj.clear()
-        renderer = QSvgRenderer(path)
-        item = QGraphicsSvgItem()
-        item.setSharedRenderer(renderer)
+        item = QGraphicsSvgItem(path)
         self.scene_obj.addItem(item)
         self.scene_obj.setSceneRect(item.boundingRect())
         self.svg_item = item
