@@ -1,47 +1,47 @@
 from __future__ import annotations
 
-from typing import Iterable
-
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+from shapely.ops import nearest_points, unary_union
 
 
-def _to_polygons(geometry: BaseGeometry, min_bridge_width: float):
-    """Convert any input geometry to polygons using a safe positive buffer."""
-    width = max(0.01, min_bridge_width / 2)
-    buffered = geometry.buffer(width, cap_style=2, join_style=2)
-    if buffered.is_empty:
+def _flatten_polygons(geom: BaseGeometry) -> list[Polygon]:
+    """Extract only polygon parts from arbitrary Shapely geometry."""
+    if geom.is_empty:
         return []
-    if buffered.geom_type == "Polygon":
-        return [buffered]
-    if buffered.geom_type == "MultiPolygon":
-        return list(buffered.geoms)
-    if hasattr(buffered, "geoms"):
-        return [g for g in buffered.geoms if g.geom_type in {"Polygon", "MultiPolygon"}]
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return list(geom.geoms)
+    if hasattr(geom, "geoms"):
+        result: list[Polygon] = []
+        for part in geom.geoms:
+            result.extend(_flatten_polygons(part))
+        return result
     return []
 
 
-def _connect_components(polygons: list[BaseGeometry], min_bridge_width: float) -> BaseGeometry:
+def _to_polygons(geometry: BaseGeometry, min_bridge_width: float) -> list[Polygon]:
+    """Convert line/curve geometry to polygonal islands via positive buffer."""
+    width = max(0.01, min_bridge_width / 2)
+    buffered = geometry.buffer(width, cap_style=2, join_style=2)
+    return _flatten_polygons(buffered)
+
+
+def _connect_components(polygons: list[Polygon], min_bridge_width: float) -> BaseGeometry:
     if not polygons:
         return unary_union([])
 
     remaining = polygons[1:]
-    connected = polygons[0]
+    connected: BaseGeometry = polygons[0]
     bridge_radius = max(0.01, min_bridge_width / 2)
 
     while remaining:
-        connected_boundary = connected.boundary
-        best_idx = -1
+        best_idx = 0
         best_dist = float("inf")
-        best_bridge = None
+        best_bridge: BaseGeometry | None = None
 
         for idx, poly in enumerate(remaining):
-            other_boundary = poly.boundary
-            p1, p2 = connected_boundary.interpolate(0, normalized=True), other_boundary.interpolate(0, normalized=True)
-            # nearest_points даёт надёжные точки на границах ближайших компонентов
-            from shapely.ops import nearest_points
-
             p1, p2 = nearest_points(connected, poly)
             dist = p1.distance(p2)
             if dist < best_dist:
@@ -56,7 +56,7 @@ def _connect_components(polygons: list[BaseGeometry], min_bridge_width: float) -
 
 
 def ensure_connected(geometry: BaseGeometry, min_bridge_width: float) -> BaseGeometry:
-    """Ensure all disconnected islands are linked by bridges of at least min_bridge_width."""
+    """Connect disconnected islands by bridges with given minimal width."""
     if geometry.is_empty:
         return geometry
 
@@ -69,13 +69,18 @@ def ensure_connected(geometry: BaseGeometry, min_bridge_width: float) -> BaseGeo
 
 
 def validate_connectivity(geometry: BaseGeometry, min_bridge_width: float = 1.0) -> bool:
-    """Topology check: after buffering, final stencil should have one connected component."""
+    """True when geometry is one connected printable island after buffering."""
     if geometry.is_empty:
         return False
+
     polygons = _to_polygons(geometry, min_bridge_width)
     if not polygons:
         return False
+
     merged = unary_union(polygons)
-    if merged.geom_type == "MultiPolygon":
+    if isinstance(merged, Polygon):
+        return True
+    if isinstance(merged, MultiPolygon):
         return len(merged.geoms) == 1
-    return merged.geom_type == "Polygon"
+    flat = _flatten_polygons(merged)
+    return len(flat) == 1
