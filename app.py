@@ -2,12 +2,12 @@ import math
 import random
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QAction, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -27,11 +27,8 @@ from PyQt6.QtWidgets import (
 
 
 @dataclass
-class VectorLine:
-    x1: float
-    y1: float
-    x2: float
-    y2: float
+class VectorPath:
+    points: List[Tuple[float, float]]
     width: float = 1.0
 
 
@@ -44,8 +41,8 @@ class VectorEngine:
     def preprocess(gray: np.ndarray, blur_sigma: float) -> np.ndarray:
         if blur_sigma <= 0:
             return gray
-        k = max(3, int(blur_sigma * 6) | 1)
-        return cv2.GaussianBlur(gray, (k, k), blur_sigma)
+        kernel = max(3, int(blur_sigma * 6) | 1)
+        return cv2.GaussianBlur(gray, (kernel, kernel), blur_sigma)
 
     @staticmethod
     def generate(
@@ -56,10 +53,9 @@ class VectorEngine:
         threshold: int,
         simplify: float,
         align_gradient: bool,
-    ) -> List[VectorLine]:
+    ) -> List[VectorPath]:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         proc = VectorEngine.preprocess(gray, blur_sigma)
-
         if mode == VectorEngine.MODE_HATCHING:
             return VectorEngine._hatching(proc, density, threshold, simplify, align_gradient)
         if mode == VectorEngine.MODE_CANNY:
@@ -67,112 +63,116 @@ class VectorEngine:
         return VectorEngine._hough_lines(proc, density, threshold)
 
     @staticmethod
-    def _hatching(
-        gray: np.ndarray,
-        density: int,
-        threshold: int,
-        simplify: float,
-        align_gradient: bool,
-    ) -> List[VectorLine]:
-        h, w = gray.shape
-        lines: List[VectorLine] = []
-
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        grad_angle = np.arctan2(gy, gx)
-
-        base_spacing = max(4, int(26 - density // 4))
-        line_len = max(6, int(12 + density // 2))
-        noise_deg = 7.0
-
-        hatch_angles = [0, 45, 90, 135]
-        darkness_boost = np.clip((255 - gray).astype(np.float32) / 255.0, 0.0, 1.0)
-        darkness_boost = np.power(darkness_boost, 1.2)
-
-        rng = random.Random(12345)
-
-        for y in range(base_spacing // 2, h, base_spacing):
-            for x in range(base_spacing // 2, w, base_spacing):
-                local = gray[max(0, y - 1):min(h, y + 2), max(0, x - 1):min(w, x + 2)]
-                darkness = 1.0 - (float(np.mean(local)) / 255.0)
-                if darkness < threshold / 255.0:
-                    continue
-
-                layers = int(np.clip(math.ceil(darkness * 4), 1, 4))
-                layers += int(darkness > 0.75)
-                layers = min(layers, 5)
-
-                stroke_w = 0.8 + 0.8 * darkness
-                d_mod = 0.8 + darkness_boost[y, x]
-
-                for i in range(layers):
-                    if align_gradient:
-                        angle = grad_angle[y, x] + math.pi / 2.0 + math.radians(rng.uniform(-noise_deg, noise_deg))
-                    else:
-                        base_angle = hatch_angles[i % len(hatch_angles)]
-                        angle = math.radians(base_angle + rng.uniform(-noise_deg, noise_deg))
-
-                    local_len = line_len * (0.7 + d_mod * 0.6)
-                    dx = math.cos(angle) * local_len * 0.5
-                    dy = math.sin(angle) * local_len * 0.5
-
-                    jitter = simplify * 0.15
-                    jx = rng.uniform(-jitter, jitter)
-                    jy = rng.uniform(-jitter, jitter)
-
-                    x1 = np.clip(x - dx + jx, 0, w - 1)
-                    y1 = np.clip(y - dy + jy, 0, h - 1)
-                    x2 = np.clip(x + dx + jx, 0, w - 1)
-                    y2 = np.clip(y + dy + jy, 0, h - 1)
-                    lines.append(VectorLine(x1, y1, x2, y2, width=stroke_w))
-
-        return lines
+    def _streamline(
+        x: float,
+        y: float,
+        angle_map: np.ndarray,
+        length: int,
+        step: float,
+        width: int,
+        height: int,
+    ) -> List[Tuple[float, float]]:
+        pts = [(x, y)]
+        for direction in (1.0, -1.0):
+            cx, cy = x, y
+            branch = []
+            for _ in range(length):
+                ix, iy = int(np.clip(round(cx), 0, width - 1)), int(np.clip(round(cy), 0, height - 1))
+                angle = float(angle_map[iy, ix])
+                cx += direction * math.cos(angle) * step
+                cy += direction * math.sin(angle) * step
+                if cx < 0 or cy < 0 or cx >= width or cy >= height:
+                    break
+                branch.append((cx, cy))
+            if direction > 0:
+                pts.extend(branch)
+            else:
+                pts = branch[::-1] + pts
+        return pts
 
     @staticmethod
-    def _canny_contours(gray: np.ndarray, density: int, threshold: int, simplify: float) -> List[VectorLine]:
+    def _hatching(gray: np.ndarray, density: int, threshold: int, simplify: float, align_gradient: bool) -> List[VectorPath]:
+        h, w = gray.shape
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad_angle = np.arctan2(gy, gx) + np.pi / 2.0
+
+        base_angles = [0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4]
+        spacing = max(3, int(24 - density // 5))
+        step = 1.5
+        segments = max(4, int(6 + density // 20))
+        darkness_threshold = threshold / 255.0
+        noise = math.radians(5 + simplify * 0.08)
+        rng = random.Random(7)
+
+        paths: List[VectorPath] = []
+        for y in range(spacing // 2, h, spacing):
+            for x in range(spacing // 2, w, spacing):
+                darkness = 1.0 - float(gray[y, x]) / 255.0
+                if darkness <= darkness_threshold:
+                    continue
+
+                layers = min(5, 1 + int(darkness * 5))
+                for i in range(layers):
+                    if align_gradient:
+                        angle_map = grad_angle + rng.uniform(-noise, noise)
+                    else:
+                        angle = base_angles[i % len(base_angles)] + rng.uniform(-noise, noise)
+                        angle_map = np.full((h, w), angle, dtype=np.float32)
+
+                    jitter = simplify * 0.1
+                    sx = float(np.clip(x + rng.uniform(-jitter, jitter), 0, w - 1))
+                    sy = float(np.clip(y + rng.uniform(-jitter, jitter), 0, h - 1))
+                    pts = VectorEngine._streamline(sx, sy, angle_map, segments, step, w, h)
+                    if len(pts) < 2:
+                        continue
+
+                    simplified = cv2.approxPolyDP(
+                        np.array(pts, dtype=np.float32).reshape(-1, 1, 2),
+                        epsilon=max(0.2, simplify * 0.03),
+                        closed=False,
+                    )
+                    sp = [(float(p[0][0]), float(p[0][1])) for p in simplified]
+                    if len(sp) > 1:
+                        paths.append(VectorPath(sp, width=0.7 + darkness * 0.9))
+        return paths
+
+    @staticmethod
+    def _canny_contours(gray: np.ndarray, density: int, threshold: int, simplify: float) -> List[VectorPath]:
         low = max(10, threshold)
-        high = max(low + 10, density)
+        high = max(low + 20, threshold + density // 2)
         edges = cv2.Canny(gray, low, high)
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
 
-        lines: List[VectorLine] = []
-        epsilon_scale = max(0.001, simplify / 100.0)
-
-        for c in contours:
-            if len(c) < 8:
+        paths: List[VectorPath] = []
+        for contour in contours:
+            if len(contour) < 10:
                 continue
-            peri = cv2.arcLength(c, False)
-            eps = epsilon_scale * peri
-            approx = cv2.approxPolyDP(c, eps, False)
-            pts = approx[:, 0, :]
-            for i in range(len(pts) - 1):
-                x1, y1 = pts[i]
-                x2, y2 = pts[i + 1]
-                lines.append(VectorLine(float(x1), float(y1), float(x2), float(y2), width=1.0))
-
-        return lines
+            perimeter = cv2.arcLength(contour, closed=False)
+            epsilon = max(0.3, (simplify / 120.0) * perimeter)
+            approx = cv2.approxPolyDP(contour, epsilon, closed=False)
+            points = [(float(p[0][0]), float(p[0][1])) for p in approx]
+            if len(points) > 1:
+                paths.append(VectorPath(points, width=1.0))
+        return paths
 
     @staticmethod
-    def _hough_lines(gray: np.ndarray, density: int, threshold: int) -> List[VectorLine]:
-        edges = cv2.Canny(gray, 50, 150)
-        min_line_len = max(20, density)
-        max_gap = max(2, threshold // 8)
-        det = cv2.HoughLinesP(
+    def _hough_lines(gray: np.ndarray, density: int, threshold: int) -> List[VectorPath]:
+        edges = cv2.Canny(gray, 50, 160)
+        detected = cv2.HoughLinesP(
             edges,
             rho=1,
             theta=np.pi / 180,
             threshold=max(30, threshold),
-            minLineLength=min_line_len,
-            maxLineGap=max_gap,
+            minLineLength=max(20, density),
+            maxLineGap=max(3, threshold // 8),
         )
-
-        lines: List[VectorLine] = []
-        if det is not None:
-            for l in det[:, 0, :]:
-                x1, y1, x2, y2 = l.tolist()
-                lines.append(VectorLine(float(x1), float(y1), float(x2), float(y2), width=1.1))
-
-        return lines
+        paths: List[VectorPath] = []
+        if detected is not None:
+            for line in detected[:, 0, :]:
+                x1, y1, x2, y2 = line.tolist()
+                paths.append(VectorPath([(float(x1), float(y1)), (float(x2), float(y2))], width=1.1))
+        return paths
 
 
 class Worker(QObject):
@@ -180,37 +180,28 @@ class Worker(QObject):
 
     @pyqtSlot(np.ndarray, str, float, int, int, float, bool)
     def process(self, image, mode, blur_sigma, density, threshold, simplify, align_gradient):
-        lines = VectorEngine.generate(image, mode, blur_sigma, density, threshold, simplify, align_gradient)
-        self.finished.emit(lines)
+        self.finished.emit(VectorEngine.generate(image, mode, blur_sigma, density, threshold, simplify, align_gradient))
 
 
 class ImagePanel(QFrame):
     def __init__(self, title: str):
         super().__init__()
-        self.label = QLabel("Load an image to begin")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title = QLabel(title)
         self.title.setObjectName("panelTitle")
-
-        lay = QVBoxLayout(self)
-        lay.addWidget(self.title)
-        lay.addWidget(self.label, 1)
-
+        self.label = QLabel("Load an image to begin")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.title)
+        layout.addWidget(self.label, 1)
         self.setObjectName("panel")
 
     def set_pixmap(self, pixmap: QPixmap):
         scaled = pixmap.scaled(self.label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.label.setPixmap(scaled)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        pm = self.label.pixmap()
-        if pm:
-            self.set_pixmap(pm)
-
 
 class MainWindow(QMainWindow):
-    triggerProcess = pyqtSignal(np.ndarray, str, float, int, int, float, bool)
+    trigger_process = pyqtSignal(np.ndarray, str, float, int, int, float, bool)
 
     def __init__(self):
         super().__init__()
@@ -218,20 +209,25 @@ class MainWindow(QMainWindow):
         self.resize(1400, 850)
 
         self.image_bgr: Optional[np.ndarray] = None
-        self.vector_lines: List[VectorLine] = []
+        self.vector_paths: List[VectorPath] = []
 
         self.worker_thread = QThread(self)
         self.worker = Worker()
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.start()
-
-        self.triggerProcess.connect(self.worker.process)
+        self.trigger_process.connect(self.worker.process)
         self.worker.finished.connect(self.on_processing_finished)
 
-        self._build_ui()
-        self._apply_style()
+        self.build_ui()
+        self.apply_style()
 
-    def _build_ui(self):
+    def slider(self, minimum: int, maximum: int, value: int) -> QSlider:
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(minimum, maximum)
+        s.setValue(value)
+        return s
+
+    def build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
         main = QHBoxLayout(root)
@@ -241,13 +237,13 @@ class MainWindow(QMainWindow):
         self.original_panel = ImagePanel("Original")
         self.preview_panel = ImagePanel("Vector Preview")
 
-        left_wrap = QHBoxLayout()
-        left_wrap.addWidget(self.original_panel, 1)
-        left_wrap.addWidget(self.preview_panel, 1)
+        canvas_layout = QHBoxLayout()
+        canvas_layout.addWidget(self.original_panel, 1)
+        canvas_layout.addWidget(self.preview_panel, 1)
 
-        canvas_card = QFrame()
-        canvas_card.setObjectName("card")
-        canvas_card.setLayout(left_wrap)
+        canvas = QFrame()
+        canvas.setObjectName("card")
+        canvas.setLayout(canvas_layout)
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
@@ -256,14 +252,13 @@ class MainWindow(QMainWindow):
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([VectorEngine.MODE_HATCHING, VectorEngine.MODE_CANNY, VectorEngine.MODE_HOUGH])
-
-        self.blur_slider = self._slider(0, 60, 10)
-        self.density_slider = self._slider(20, 200, 120)
-        self.threshold_slider = self._slider(0, 255, 80)
-        self.simplify_slider = self._slider(1, 100, 30)
-
         self.align_combo = QComboBox()
         self.align_combo.addItems(["Predefined Hatching Angles", "Align with Gradient"])
+
+        self.blur_slider = self.slider(0, 60, 10)
+        self.density_slider = self.slider(20, 220, 130)
+        self.threshold_slider = self.slider(0, 255, 70)
+        self.simplify_slider = self.slider(1, 100, 28)
 
         self.load_btn = QPushButton("Load Image")
         self.export_btn = QPushButton("Export SVG")
@@ -278,35 +273,28 @@ class MainWindow(QMainWindow):
         form.addRow(self.load_btn)
         form.addRow(self.export_btn)
 
-        for w in [self.mode_combo, self.blur_slider, self.density_slider, self.threshold_slider, self.simplify_slider, self.align_combo]:
-            if isinstance(w, QSlider):
-                w.valueChanged.connect(self.request_processing)
+        for widget in [self.mode_combo, self.align_combo, self.blur_slider, self.density_slider, self.threshold_slider, self.simplify_slider]:
+            if isinstance(widget, QSlider):
+                widget.valueChanged.connect(self.request_processing)
             else:
-                w.currentIndexChanged.connect(self.request_processing)
+                widget.currentIndexChanged.connect(self.request_processing)
 
         self.load_btn.clicked.connect(self.load_image)
         self.export_btn.clicked.connect(self.export_svg)
 
-        main.addWidget(canvas_card, 3)
+        main.addWidget(canvas, 3)
         main.addWidget(sidebar, 1)
 
         shadow = QGraphicsDropShadowEffect(blurRadius=30, xOffset=0, yOffset=10)
         shadow.setColor(Qt.GlobalColor.lightGray)
-        canvas_card.setGraphicsEffect(shadow)
+        canvas.setGraphicsEffect(shadow)
 
-        act_open = QAction("Open", self)
-        act_open.triggered.connect(self.load_image)
-        self.addAction(act_open)
+        open_action = QAction("Open", self)
+        open_action.triggered.connect(self.load_image)
+        self.addAction(open_action)
 
-    def _slider(self, mi: int, ma: int, value: int) -> QSlider:
-        s = QSlider(Qt.Orientation.Horizontal)
-        s.setRange(mi, ma)
-        s.setValue(value)
-        return s
-
-    def _apply_style(self):
-        self.setStyleSheet(
-            """
+    def apply_style(self):
+        self.setStyleSheet("""
             QMainWindow { background: #F5F7FB; }
             #card, #sidebar, #panel {
                 background: white;
@@ -315,117 +303,84 @@ class MainWindow(QMainWindow):
             }
             #sidebar { padding: 18px; }
             #panel { padding: 12px; }
-            #panelTitle {
-                color: #111827;
-                font-weight: 600;
-                font-size: 15px;
-                padding-bottom: 8px;
-            }
+            #panelTitle { color: #111827; font-weight: 600; font-size: 15px; padding-bottom: 8px; }
             QLabel { color: #4B5563; font-size: 13px; }
             QPushButton {
-                background: #111827;
-                color: white;
-                border: none;
-                border-radius: 12px;
-                padding: 10px 14px;
-                font-weight: 600;
+                background: #111827; color: white; border: none; border-radius: 12px; padding: 10px 14px; font-weight: 600;
             }
             QPushButton:hover { background: #1F2937; }
             QPushButton:disabled { background: #9CA3AF; }
-            QComboBox, QSlider {
-                background: #F9FAFB;
-                border: 1px solid #E5E7EB;
-                border-radius: 10px;
-                padding: 6px;
-            }
-            QSlider::groove:horizontal {
-                border: none;
-                height: 6px;
-                background: #E5E7EB;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #111827;
-                border: none;
-                width: 16px;
-                margin: -5px 0;
-                border-radius: 8px;
-            }
-            """
-        )
+            QComboBox, QSlider { background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 10px; padding: 6px; }
+            QSlider::groove:horizontal { border: none; height: 6px; background: #E5E7EB; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #111827; border: none; width: 16px; margin: -5px 0; border-radius: 8px; }
+        """)
 
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
         if not path:
             return
-        img = cv2.imread(path)
-        if img is None:
+        image = cv2.imread(path)
+        if image is None:
             QMessageBox.critical(self, "Error", "Unable to read image file.")
             return
-
-        self.image_bgr = img
-        self.original_panel.set_pixmap(self.cv_to_pixmap(img))
+        self.image_bgr = image
+        self.original_panel.set_pixmap(self.cv_to_pixmap(image))
         self.request_processing()
 
     def request_processing(self):
         if self.image_bgr is None:
             return
-        blur_sigma = self.blur_slider.value() / 10.0
-        density = self.density_slider.value()
-        threshold = self.threshold_slider.value()
-        simplify = float(self.simplify_slider.value())
-        mode = self.mode_combo.currentText()
-        align_gradient = self.align_combo.currentIndex() == 1
-        self.triggerProcess.emit(self.image_bgr.copy(), mode, blur_sigma, density, threshold, simplify, align_gradient)
+        self.trigger_process.emit(
+            self.image_bgr.copy(),
+            self.mode_combo.currentText(),
+            self.blur_slider.value() / 10.0,
+            self.density_slider.value(),
+            self.threshold_slider.value(),
+            float(self.simplify_slider.value()),
+            self.align_combo.currentIndex() == 1,
+        )
 
     @pyqtSlot(list)
-    def on_processing_finished(self, lines: List[VectorLine]):
-        self.vector_lines = lines
-        self.export_btn.setEnabled(len(lines) > 0)
+    def on_processing_finished(self, paths: List[VectorPath]):
+        self.vector_paths = paths
+        self.export_btn.setEnabled(bool(paths))
         if self.image_bgr is None:
             return
-
         preview = np.full_like(self.image_bgr, 255)
-        for ln in lines:
-            cv2.line(
-                preview,
-                (int(ln.x1), int(ln.y1)),
-                (int(ln.x2), int(ln.y2)),
-                (0, 0, 0),
-                thickness=max(1, int(round(ln.width))),
-                lineType=cv2.LINE_AA,
-            )
+        for path in paths:
+            pts = np.array(path.points, dtype=np.int32).reshape(-1, 1, 2)
+            if len(pts) > 1:
+                cv2.polylines(preview, [pts], isClosed=False, color=(0, 0, 0), thickness=max(1, int(round(path.width))), lineType=cv2.LINE_AA)
         self.preview_panel.set_pixmap(self.cv_to_pixmap(preview))
 
     def export_svg(self):
-        if self.image_bgr is None or not self.vector_lines:
+        if self.image_bgr is None or not self.vector_paths:
             return
-        default_name = "vector_sketch.svg"
-        path, _ = QFileDialog.getSaveFileName(self, "Export SVG", default_name, "SVG Files (*.svg)")
-        if not path:
+        save_path, _ = QFileDialog.getSaveFileName(self, "Export SVG", "vector_sketch.svg", "SVG Files (*.svg)")
+        if not save_path:
             return
 
         h, w = self.image_bgr.shape[:2]
-        svg_lines = [
+        svg = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
-            '<g stroke="black" fill="none" stroke-linecap="round">',
+            '<g stroke="black" fill="none" stroke-linecap="round" stroke-linejoin="round">',
         ]
-        for ln in self.vector_lines:
-            svg_lines.append(
-                f'<line x1="{ln.x1:.2f}" y1="{ln.y1:.2f}" x2="{ln.x2:.2f}" y2="{ln.y2:.2f}" stroke-width="{ln.width:.2f}" />'
-            )
-        svg_lines.append("</g></svg>")
+        for path in self.vector_paths:
+            if len(path.points) < 2:
+                continue
+            d = "M " + " L ".join(f"{x:.2f} {y:.2f}" for x, y in path.points)
+            svg.append(f'<path d="{d}" stroke-width="{path.width:.2f}" fill="none" />')
+        svg.append("</g></svg>")
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(svg_lines))
-
-        QMessageBox.information(self, "Export Complete", f"SVG saved to:\n{path}")
+        with open(save_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(svg))
+        QMessageBox.information(self, "Export Complete", f"SVG saved to:\n{save_path}")
 
     @staticmethod
-    def cv_to_pixmap(img_bgr: np.ndarray) -> QPixmap:
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+    def cv_to_pixmap(image_bgr: np.ndarray) -> QPixmap:
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        h, w, channels = rgb.shape
+        qimg = QImage(rgb.data, w, h, channels * w, QImage.Format.Format_RGB888)
         return QPixmap.fromImage(qimg.copy())
 
     def closeEvent(self, event):
@@ -436,8 +391,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())
 
 
