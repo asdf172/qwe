@@ -2,11 +2,11 @@ import math
 import random
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -53,14 +53,25 @@ class VectorEngine:
         threshold: int,
         simplify: float,
         align_gradient: bool,
+        quality: int,
+        photo_boost: bool,
     ) -> List[VectorPath]:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         proc = VectorEngine.preprocess(gray, blur_sigma)
+        if photo_boost:
+            proc = VectorEngine.photo_enhance(proc)
         if mode == VectorEngine.MODE_HATCHING:
-            return VectorEngine._hatching(proc, density, threshold, simplify, align_gradient)
+            return VectorEngine._hatching(proc, density, threshold, simplify, align_gradient, quality)
         if mode == VectorEngine.MODE_CANNY:
             return VectorEngine._canny_contours(proc, density, threshold, simplify)
         return VectorEngine._hough_lines(proc, density, threshold)
+
+
+    @staticmethod
+    def photo_enhance(gray: np.ndarray) -> np.ndarray:
+        clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        return cv2.bilateralFilter(enhanced, d=5, sigmaColor=30, sigmaSpace=30)
 
     @staticmethod
     def _streamline(
@@ -91,16 +102,16 @@ class VectorEngine:
         return pts
 
     @staticmethod
-    def _hatching(gray: np.ndarray, density: int, threshold: int, simplify: float, align_gradient: bool) -> List[VectorPath]:
+    def _hatching(gray: np.ndarray, density: int, threshold: int, simplify: float, align_gradient: bool, quality: int) -> List[VectorPath]:
         h, w = gray.shape
         gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         grad_angle = np.arctan2(gy, gx) + np.pi / 2.0
 
         base_angles = [0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4]
-        spacing = max(3, int(24 - density // 5))
-        step = 1.5
-        segments = max(4, int(6 + density // 20))
+        spacing = max(2, int(26 - density // 5 - quality // 12))
+        step = max(0.8, 1.7 - quality * 0.01)
+        segments = max(6, int(8 + density // 18 + quality // 8))
         darkness_threshold = threshold / 255.0
         noise = math.radians(5 + simplify * 0.08)
         rng = random.Random(7)
@@ -112,10 +123,11 @@ class VectorEngine:
                 if darkness <= darkness_threshold:
                     continue
 
-                layers = min(5, 1 + int(darkness * 5))
+                layers = min(8, 1 + int(darkness * 6 + quality / 25))
                 for i in range(layers):
                     if align_gradient:
-                        angle_map = grad_angle + rng.uniform(-noise, noise)
+                        swirl = cv2.GaussianBlur(grad_angle, (0, 0), sigmaX=1.2 + quality * 0.02)
+                        angle_map = swirl + rng.uniform(-noise, noise)
                     else:
                         angle = base_angles[i % len(base_angles)] + rng.uniform(-noise, noise)
                         angle_map = np.full((h, w), angle, dtype=np.float32)
@@ -178,9 +190,9 @@ class VectorEngine:
 class Worker(QObject):
     finished = pyqtSignal(list)
 
-    @pyqtSlot(np.ndarray, str, float, int, int, float, bool)
-    def process(self, image, mode, blur_sigma, density, threshold, simplify, align_gradient):
-        self.finished.emit(VectorEngine.generate(image, mode, blur_sigma, density, threshold, simplify, align_gradient))
+    @pyqtSlot(np.ndarray, str, float, int, int, float, bool, int, bool)
+    def process(self, image, mode, blur_sigma, density, threshold, simplify, align_gradient, quality, photo_boost):
+        self.finished.emit(VectorEngine.generate(image, mode, blur_sigma, density, threshold, simplify, align_gradient, quality, photo_boost))
 
 
 class ImagePanel(QFrame):
@@ -201,7 +213,7 @@ class ImagePanel(QFrame):
 
 
 class MainWindow(QMainWindow):
-    trigger_process = pyqtSignal(np.ndarray, str, float, int, int, float, bool)
+    trigger_process = pyqtSignal(np.ndarray, str, float, int, int, float, bool, int, bool)
 
     def __init__(self):
         super().__init__()
@@ -259,6 +271,10 @@ class MainWindow(QMainWindow):
         self.density_slider = self.slider(20, 220, 130)
         self.threshold_slider = self.slider(0, 255, 70)
         self.simplify_slider = self.slider(1, 100, 28)
+        self.quality_slider = self.slider(10, 100, 70)
+
+        self.photo_combo = QComboBox()
+        self.photo_combo.addItems(["Standard", "Photo Boost"])
 
         self.load_btn = QPushButton("Load Image")
         self.export_btn = QPushButton("Export SVG")
@@ -269,15 +285,21 @@ class MainWindow(QMainWindow):
         form.addRow("Density", self.density_slider)
         form.addRow("Threshold", self.threshold_slider)
         form.addRow("Simplicity", self.simplify_slider)
+        form.addRow("Quality", self.quality_slider)
+        form.addRow("Input Tuning", self.photo_combo)
         form.addRow("Line Orientation", self.align_combo)
         form.addRow(self.load_btn)
         form.addRow(self.export_btn)
 
-        for widget in [self.mode_combo, self.align_combo, self.blur_slider, self.density_slider, self.threshold_slider, self.simplify_slider]:
+        for widget in [self.mode_combo, self.align_combo, self.photo_combo, self.blur_slider, self.density_slider, self.threshold_slider, self.simplify_slider, self.quality_slider]:
             if isinstance(widget, QSlider):
                 widget.valueChanged.connect(self.request_processing)
             else:
                 widget.currentIndexChanged.connect(self.request_processing)
+
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self._request_processing_now)
 
         self.load_btn.clicked.connect(self.load_image)
         self.export_btn.clicked.connect(self.export_svg)
@@ -330,6 +352,11 @@ class MainWindow(QMainWindow):
     def request_processing(self):
         if self.image_bgr is None:
             return
+        self.update_timer.start(120)
+
+    def _request_processing_now(self):
+        if self.image_bgr is None:
+            return
         self.trigger_process.emit(
             self.image_bgr.copy(),
             self.mode_combo.currentText(),
@@ -338,6 +365,8 @@ class MainWindow(QMainWindow):
             self.threshold_slider.value(),
             float(self.simplify_slider.value()),
             self.align_combo.currentIndex() == 1,
+            self.quality_slider.value(),
+            self.photo_combo.currentIndex() == 1,
         )
 
     @pyqtSlot(list)
